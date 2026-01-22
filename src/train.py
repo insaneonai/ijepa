@@ -41,7 +41,7 @@ from src.utils.logging import (
     grad_logger,
     AverageMeter)
 from src.utils.tensors import repeat_interleave_batch
-from src.datasets.imagenet1k import make_imagenet1k
+from src.datasets.imagenet1k import make_imagenet1k, make_flyingObjects3d
 
 from src.helper import (
     load_checkpoint,
@@ -100,19 +100,23 @@ def main(args, resume_preempt=False):
     # --
 
     # -- MASK
-    allow_overlap = args['mask']['allow_overlap']  # whether to allow overlap b/w context and target blocks
+    # whether to allow overlap b/w context and target blocks
+    allow_overlap = args['mask']['allow_overlap']
     patch_size = args['mask']['patch_size']  # patch-size for model training
     num_enc_masks = args['mask']['num_enc_masks']  # number of context blocks
-    min_keep = args['mask']['min_keep']  # min number of patches in context block
+    # min number of patches in context block
+    min_keep = args['mask']['min_keep']
     enc_mask_scale = args['mask']['enc_mask_scale']  # scale of context blocks
     num_pred_masks = args['mask']['num_pred_masks']  # number of target blocks
     pred_mask_scale = args['mask']['pred_mask_scale']  # scale of target blocks
-    aspect_ratio = args['mask']['aspect_ratio']  # aspect ratio of target blocks
+    # aspect ratio of target blocks
+    aspect_ratio = args['mask']['aspect_ratio']
     # --
 
     # -- OPTIMIZATION
     ema = args['optimization']['ema']
-    ipe_scale = args['optimization']['ipe_scale']  # scheduler scale factor (def: 1.0)
+    # scheduler scale factor (def: 1.0)
+    ipe_scale = args['optimization']['ipe_scale']
     wd = float(args['optimization']['weight_decay'])
     final_wd = float(args['optimization']['final_weight_decay'])
     num_epochs = args['optimization']['epochs']
@@ -147,7 +151,8 @@ def main(args, resume_preempt=False):
     latest_path = os.path.join(folder, f'{tag}-latest.pth.tar')
     load_path = None
     if load_model:
-        load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+        load_path = os.path.join(
+            folder, r_file) if r_file is not None else latest_path
 
     # -- make csv_logger
     csv_logger = CSVLogger(log_file,
@@ -190,18 +195,18 @@ def main(args, resume_preempt=False):
 
     # -- init data-loaders/samplers
     _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
-            transform=transform,
-            batch_size=batch_size,
-            collator=mask_collator,
-            pin_mem=pin_mem,
-            training=True,
-            num_workers=num_workers,
-            world_size=world_size,
-            rank=rank,
-            root_path=root_path,
-            image_folder=image_folder,
-            copy_data=copy_data,
-            drop_last=True)
+        transform=transform,
+        batch_size=batch_size,
+        collator=mask_collator,
+        pin_mem=pin_mem,
+        training=True,
+        num_workers=num_workers,
+        world_size=world_size,
+        rank=rank,
+        root_path=root_path,
+        image_folder=image_folder,
+        copy_data=copy_data,
+        drop_last=True)
     ipe = len(unsupervised_loader)
 
     # -- init optimizer and scheduler
@@ -279,11 +284,14 @@ def main(args, resume_preempt=False):
 
             def load_imgs():
                 # -- unsupervised imgs
-                imgs = udata[0].to(device, non_blocking=True)
+                left_imgs = udata[0].to(
+                    device, non_blocking=True)  # Context view
+                right_imgs = udata[1].to(
+                    device, non_blocking=True)  # Target view
                 masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
                 masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
-                return (imgs, masks_1, masks_2)
-            imgs, masks_enc, masks_pred = load_imgs()
+                return (left_imgs, right_imgs, masks_1, masks_2)
+            left_imgs, right_imgs, masks_enc, masks_pred = load_imgs()
             maskA_meter.update(len(masks_enc[0][0]))
             maskB_meter.update(len(masks_pred[0][0]))
 
@@ -294,16 +302,18 @@ def main(args, resume_preempt=False):
 
                 def forward_target():
                     with torch.no_grad():
-                        h = target_encoder(imgs)
-                        h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
+                        h = target_encoder(right_imgs)
+                        # normalize over feature-dim
+                        h = F.layer_norm(h, (h.size(-1),))
                         B = len(h)
                         # -- create targets (masked regions of h)
                         h = apply_masks(h, masks_pred)
-                        h = repeat_interleave_batch(h, B, repeat=len(masks_enc))
+                        h = repeat_interleave_batch(
+                            h, B, repeat=len(masks_enc))
                         return h
 
                 def forward_context():
-                    z = encoder(imgs, masks_enc)
+                    z = encoder(left_imgs, masks_enc)
                     z = predictor(z, masks_enc, masks_pred)
                     return z
 
@@ -333,7 +343,8 @@ def main(args, resume_preempt=False):
                 with torch.no_grad():
                     m = next(momentum_scheduler)
                     for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
-                        param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+                        param_k.data.mul_(m).add_(
+                            (1.-m) * param_q.detach().data)
 
                 return (float(loss), _new_lr, _new_wd, grad_stats)
             (loss, _new_lr, _new_wd, grad_stats), etime = gpu_timer(train_step)
@@ -342,7 +353,8 @@ def main(args, resume_preempt=False):
 
             # -- Logging
             def log_stats():
-                csv_logger.log(epoch + 1, itr, loss, maskA_meter.val, maskB_meter.val, etime)
+                csv_logger.log(epoch + 1, itr, loss,
+                               maskA_meter.val, maskB_meter.val, etime)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                     logger.info('[%d, %5d] loss: %.3f '
                                 'masks: %.1f %.1f '

@@ -15,6 +15,7 @@ from logging import getLogger
 
 import torch
 import torchvision
+from torchvision.datasets import FlyingThings3D
 
 _GLOBAL_SEED = 0
 logger = getLogger()
@@ -61,6 +62,121 @@ def make_imagenet1k(
     logger.info('ImageNet unsupervised data loader created')
 
     return dataset, data_loader, dist_sampler
+
+
+def make_flyingObjects3d(
+    transform,
+    batch_size,
+    collator=None,
+    pin_mem=True,
+    num_workers=8,
+    world_size=1,
+    rank=0,
+    root_path=None,
+    training=True,
+    drop_last=True,
+    target_type='disparity',
+    pass_name='clean'
+):
+    """
+    Create FlyingThings3D stereo dataset and dataloader.
+
+    Matches I-JEPA's make_imagenet1k signature for compatibility.
+
+    Args:
+        transform: Transform to apply to images
+        batch_size: Batch size
+        collator: MaskCollator for generating masks
+        pin_mem: Pin memory for DataLoader
+        num_workers: Number of workers
+        world_size: Number of GPUs (1 for single GPU)
+        rank: GPU rank (0 for single GPU)
+        root_path: Path to FlyingThings3D root directory
+        training: Whether to use train or test split
+        drop_last: Drop last incomplete batch
+        target_type: 'disparity', 'flow', or None
+        pass_name: 'clean' or 'final'
+
+    Returns:
+        dataset, data_loader, sampler (for compatibility with I-JEPA)
+    """
+    split = 'train' if training else 'test'
+
+    # Wrapper to make FlyingThings3D compatible with I-JEPA
+    base_dataset = FlyingThings3D(
+        root=root_path,
+        transform=None,  # We'll apply transform in wrapper
+        target_type=target_type,
+        pass_name=pass_name,
+        split=split,
+        camera='both'  # Returns (left, right, target)
+    )
+
+    # Wrap to return only stereo pair for I-JEPA
+    dataset = StereoDatasetWrapper(base_dataset, transform)
+
+    logger.info(
+        f'FlyingThings3D dataset created ({split} split, {len(dataset)} samples)')
+
+    # For single GPU, use regular sampler (not distributed)
+    if world_size == 1:
+        sampler = torch.utils.data.RandomSampler(dataset) if training else None
+    else:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset=dataset,
+            num_replicas=world_size,
+            rank=rank
+        )
+
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        collate_fn=collator,
+        sampler=sampler,
+        batch_size=batch_size,
+        shuffle=(sampler is None and training),  # Only shuffle if no sampler
+        drop_last=drop_last,
+        pin_memory=pin_mem,
+        num_workers=num_workers,
+        persistent_workers=False
+    )
+    logger.info('FlyingThings3D data loader created')
+
+    return dataset, data_loader, sampler
+
+
+class StereoDatasetWrapper(torch.utils.data.Dataset):
+    """
+    Wrapper for FlyingThings3D to work with I-JEPA's MaskCollator.
+
+    FlyingThings3D returns: (img_left, img_right, target)
+    This wrapper returns: (img_left, img_right) for stereo training
+    """
+
+    def __init__(self, base_dataset, transform=None):
+        self.base_dataset = base_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        img_left, img_right, target = self.base_dataset[idx]
+
+        # Apply same transform to both views
+        if self.transform is not None:
+            # Use same random seed for both to ensure consistent augmentation
+            seed = np.random.randint(2147483647)
+
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            img_left = self.transform(img_left)
+
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            img_right = self.transform(img_right)
+
+        # Return stereo pair (target/disparity can be added later for evaluation)
+        return (img_left, img_right)
 
 
 class ImageNet(torchvision.datasets.ImageFolder):
@@ -122,7 +238,8 @@ class ImageNet(torchvision.datasets.ImageFolder):
                 indices = np.squeeze(np.argwhere(
                     self.targets == t)).tolist()
                 self.target_indices.append(indices)
-                mint = len(indices) if mint is None else min(mint, len(indices))
+                mint = len(indices) if mint is None else min(
+                    mint, len(indices))
                 logger.debug(f'num-labeled target {t} {len(indices)}')
             logger.info(f'min. labeled indices {mint}')
 
