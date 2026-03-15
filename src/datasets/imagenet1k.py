@@ -12,10 +12,10 @@ import time
 import numpy as np
 
 from logging import getLogger
+from PIL import Image
 
 import torch
 import torchvision
-from torchvision.datasets import FlyingThings3D
 
 _GLOBAL_SEED = 0
 logger = getLogger()
@@ -76,7 +76,8 @@ def make_flyingObjects3d(
     training=True,
     drop_last=True,
     target_type='disparity',
-    pass_name='clean'
+    pass_name='clean',
+    max_samples=2000
 ):
     """
     Create FlyingThings3D stereo dataset and dataloader.
@@ -91,29 +92,26 @@ def make_flyingObjects3d(
         num_workers: Number of workers
         world_size: Number of GPUs (1 for single GPU)
         rank: GPU rank (0 for single GPU)
-        root_path: Path to FlyingThings3D root directory
+        root_path: Path to FlyingThings3D subset root directory
         training: Whether to use train or test split
         drop_last: Drop last incomplete batch
         target_type: 'disparity', 'flow', or None
         pass_name: 'clean' or 'final'
+        max_samples: Maximum number of stereo pairs to use
 
     Returns:
         dataset, data_loader, sampler (for compatibility with I-JEPA)
     """
-    split = 'train' if training else 'test'
+    split = 'train' if training else 'val'
 
-    # Wrapper to make FlyingThings3D compatible with I-JEPA
-    base_dataset = FlyingThings3D(
+    # Use custom FlyingThings3D subset dataset
+    dataset = FlyingThings3DSubset(
         root=root_path,
-        transform=None,  # We'll apply transform in wrapper
-        target_type=target_type,
-        pass_name=pass_name,
         split=split,
-        camera='both'  # Returns (left, right, target)
+        pass_name=pass_name,
+        transform=transform,
+        max_samples=max_samples
     )
-
-    # Wrap to return only stereo pair for I-JEPA
-    dataset = StereoDatasetWrapper(base_dataset, transform)
 
     logger.info(
         f'FlyingThings3D dataset created ({split} split, {len(dataset)} samples)')
@@ -142,6 +140,109 @@ def make_flyingObjects3d(
     logger.info('FlyingThings3D data loader created')
 
     return dataset, data_loader, sampler
+
+
+class FlyingThings3DSubset(torch.utils.data.Dataset):
+    """
+    Custom dataset for FlyingThings3D subset.
+
+    Folder structure expected:
+    root/
+        train/
+            image_clean/
+                left/
+                    0000000.png
+                    0000001.png
+                    ...
+                right/
+                    0000000.png
+                    0000001.png
+                    ...
+        val/
+            image_clean/
+                left/
+                right/
+    """
+
+    def __init__(self, root, split='train', pass_name='clean', transform=None, max_samples=2000):
+        """
+        Args:
+            root: Path to FlyingThings3D subset root directory
+            split: 'train' or 'val'
+            pass_name: 'clean' or 'final' (folder is named image_clean or image_final)
+            transform: Transform to apply to images
+            max_samples: Maximum number of stereo pairs to keep
+        """
+        self.root = root
+        self.split = split
+        self.pass_name = pass_name
+        self.transform = transform
+        self.max_samples = max_samples
+
+        # Construct paths based on subset structure
+        image_folder = f'image_{pass_name}'
+        self.left_dir = os.path.join(root, split, image_folder, 'left')
+        self.right_dir = os.path.join(root, split, image_folder, 'right')
+
+        # Verify directories exist
+        if not os.path.exists(self.left_dir):
+            raise FileNotFoundError(
+                f"Left image directory not found: {self.left_dir}\n"
+                f"Expected structure: {root}/{split}/{image_folder}/left/"
+            )
+        if not os.path.exists(self.right_dir):
+            raise FileNotFoundError(
+                f"Right image directory not found: {self.right_dir}\n"
+                f"Expected structure: {root}/{split}/{image_folder}/right/"
+            )
+
+        # Get list of image files (assuming left and right have same filenames)
+        self.image_files = sorted([
+            f for f in os.listdir(self.left_dir)
+            if f.endswith(('.png', '.jpg', '.jpeg'))
+        ])
+
+        if len(self.image_files) == 0:
+            raise ValueError(f"No images found in {self.left_dir}")
+
+        if self.max_samples is not None:
+            original_count = len(self.image_files)
+            self.image_files = self.image_files[:self.max_samples]
+            if len(self.image_files) < original_count:
+                logger.info(
+                    f"FlyingThings3DSubset: Limiting {split} split to {len(self.image_files)} stereo pairs "
+                    f"(from {original_count})")
+
+        logger.info(
+            f"FlyingThings3DSubset: Found {len(self.image_files)} stereo pairs in {split} split")
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_name = self.image_files[idx]
+
+        # Load left and right images
+        left_path = os.path.join(self.left_dir, img_name)
+        right_path = os.path.join(self.right_dir, img_name)
+
+        img_left = Image.open(left_path).convert('RGB')
+        img_right = Image.open(right_path).convert('RGB')
+
+        # Apply same transform to both views with same random seed
+        if self.transform is not None:
+            seed = np.random.randint(2147483647)
+
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            img_left = self.transform(img_left)
+
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            img_right = self.transform(img_right)
+
+        # Return stereo pair
+        return (img_left, img_right)
 
 
 class StereoDatasetWrapper(torch.utils.data.Dataset):

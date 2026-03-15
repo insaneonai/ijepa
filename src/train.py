@@ -194,7 +194,7 @@ def main(args, resume_preempt=False):
         color_jitter=color_jitter)
 
     # -- init data-loaders/samplers
-    _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
+    _, unsupervised_loader, unsupervised_sampler = make_flyingObjects3d(
         transform=transform,
         batch_size=batch_size,
         collator=mask_collator,
@@ -203,10 +203,7 @@ def main(args, resume_preempt=False):
         num_workers=num_workers,
         world_size=world_size,
         rank=rank,
-        root_path=root_path,
-        image_folder=image_folder,
-        copy_data=copy_data,
-        drop_last=True)
+        root_path=root_path)
     ipe = len(unsupervised_loader)
 
     # -- init optimizer and scheduler
@@ -272,8 +269,8 @@ def main(args, resume_preempt=False):
     for epoch in range(start_epoch, num_epochs):
         logger.info('Epoch %d' % (epoch + 1))
 
-        # -- update distributed-data-loader epoch
-        unsupervised_sampler.set_epoch(epoch)
+        if rank != 0:
+            unsupervised_sampler.set_epoch(epoch)
 
         loss_meter = AverageMeter()
         maskA_meter = AverageMeter()
@@ -284,14 +281,20 @@ def main(args, resume_preempt=False):
 
             def load_imgs():
                 # -- unsupervised imgs
-                left_imgs = udata[0].to(
-                    device, non_blocking=True)  # Context view
-                right_imgs = udata[1].to(
-                    device, non_blocking=True)  # Target view
+                left_imgs = udata[0].to(device, non_blocking=True)
+                right_imgs = udata[1].to(device, non_blocking=True)
+                if torch.rand(1).item() < 0.5:
+                    context_imgs = left_imgs
+                    target_imgs = right_imgs
+                    target_view_id = 1  # right
+                else:
+                    context_imgs = right_imgs
+                    target_imgs = left_imgs
+                    target_view_id = 0  # left
                 masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
                 masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
-                return (left_imgs, right_imgs, masks_1, masks_2)
-            left_imgs, right_imgs, masks_enc, masks_pred = load_imgs()
+                return (context_imgs, target_imgs, target_view_id, masks_1, masks_2)
+            context_imgs, target_imgs, target_view_id, masks_enc, masks_pred = load_imgs()
             maskA_meter.update(len(masks_enc[0][0]))
             maskB_meter.update(len(masks_pred[0][0]))
 
@@ -302,7 +305,7 @@ def main(args, resume_preempt=False):
 
                 def forward_target():
                     with torch.no_grad():
-                        h = target_encoder(right_imgs)
+                        h = target_encoder(target_imgs)
                         # normalize over feature-dim
                         h = F.layer_norm(h, (h.size(-1),))
                         B = len(h)
@@ -313,8 +316,14 @@ def main(args, resume_preempt=False):
                         return h
 
                 def forward_context():
-                    z = encoder(left_imgs, masks_enc)
-                    z = predictor(z, masks_enc, masks_pred)
+                    z = encoder(context_imgs, masks_enc)
+                    target_views = torch.full(
+                        (context_imgs.size(0),),
+                        target_view_id,
+                        device=context_imgs.device,
+                        dtype=torch.long)
+                    z = predictor(z, masks_enc, masks_pred,
+                                  target_views=target_views)
                     return z
 
                 def loss_fn(z, h):
